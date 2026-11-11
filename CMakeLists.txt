@@ -81,6 +81,7 @@ add_executable(lego_dimensions
     src/hle/overrides/hle_toypad_hid.cpp
     src/hle/overrides/hle_pad.cpp
     src/hle/overrides/hle_pad_sdl.cpp
+    src/hle/overrides/hle_pad_share.cpp
     src/hle/overrides/hle_radar.cpp
     src/hle/overrides/hle_mods.cpp
     src/hle/overrides/hle_anomaly.cpp

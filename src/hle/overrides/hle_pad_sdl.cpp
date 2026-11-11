@@ -34,6 +34,7 @@ struct Slot {
     State state;      // com g_mutex
     char name[96] = ""; // com g_mutex
     const char* icons = ""; // Fase 62: com g_mutex
+    Device device;          // Fase 80: com g_mutex
     std::atomic<u32> rumble{0xFFFFFFFF}; // pedido pendente: (grande << 8) | pequeno
 };
 Slot g_slots[kSlots];
@@ -150,6 +151,17 @@ void Thread() {
                         case SDL_GAMEPAD_TYPE_GAMECUBE: slot.icons = "wiiu"; break;
                         default: slot.icons = "xboxone"; break;
                         }
+                        // Fase 80: para o roster do LegoToypad saber que aparelho e deste jogador
+                        Device& device = slot.device;
+                        device = Device{};
+                        device.instance_id = static_cast<s32>(event.gdevice.which);
+                        const SDL_GUID guid = SDL_GetJoystickGUID(SDL_GetGamepadJoystick(slot.pad));
+                        std::memcpy(device.guid, guid.data, sizeof(device.guid));
+                        device.vendor = SDL_GetGamepadVendor(slot.pad);
+                        device.product = SDL_GetGamepadProduct(slot.pad);
+                        const char* path = SDL_GetGamepadPath(slot.pad);
+                        std::snprintf(device.path, sizeof(device.path), "%s", path ? path : "");
+                        std::snprintf(device.name, sizeof(device.name), "%s", slot.name);
                     }
                     SDL_SetGamepadPlayerIndex(slot.pad, free_slot); // LED / luz do controle com o numero do jogador
                     std::printf("[PAD-SDL] controller opened as player %d: %s (type %s, %d touchpad(s))\n", free_slot + 1,
@@ -167,6 +179,7 @@ void Thread() {
                         slot.state = State{};
                         slot.name[0] = 0;
                         slot.icons = "";
+                        slot.device = Device{};
                     }
                 }
             }
@@ -233,6 +246,19 @@ const char* IconPlatform(int slot) {
     }
     std::lock_guard lock(g_mutex);
     return g_slots[slot].icons;
+}
+
+bool GetDevice(int slot, Device* out) {
+    *out = Device{};
+    if (slot < 0 || slot >= kSlots) {
+        return false;
+    }
+    std::lock_guard lock(g_mutex);
+    if (!g_slots[slot].state.connected) {
+        return false;
+    }
+    *out = g_slots[slot].device;
+    return true;
 }
 
 } // namespace hle::padsdl
