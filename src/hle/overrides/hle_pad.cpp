@@ -36,6 +36,7 @@
 
 #include "hle/overrides/hle_override.h"
 #include "hle/overrides/hle_pad_sdl.h"
+#include "hle/overrides/hle_pad_share.h"
 #include "hle/overrides/hle_videoout.h"
 
 namespace hle {
@@ -323,7 +324,11 @@ bool FreshKey(int vk) {
 }
 
 void ReadKeyboard(Input& in, bool player1 = true) {
-    if (!g_keyboard_enabled || !videoout::WindowHasFocus()) {
+    // Fase 80: com o LegoToypad na frente, o teclado so continua no jogo se o app disser que nao o usa (e o jogador do
+    // teclado nao esta dentro dele)
+    const bool keyboard_shared = padshare::PickerInFront() && padshare::ShareKeyboardRequested() &&
+                                 !((padshare::CapturedPlayers() >> g_keyboard_player.load()) & 1);
+    if (!g_keyboard_enabled || !(videoout::WindowHasFocus() || keyboard_shared)) {
         g_had_focus = false;
         return;
     }
@@ -386,8 +391,10 @@ bool g_background_pad = false;
 bool g_pad_blocked = false;
 u32 g_pad_held_mask = 0;
 
+// Fase 80: a janela do app LegoToypad na frente (com o bloco por jogador vivo) tambem libera: quem esta no app fica
+// parado pelo CaptureGate, os outros jogadores continuam.
 bool PadFocusGate() {
-    const bool allowed = g_background_pad || !videoout::WindowHandle() || videoout::WindowHasFocus();
+    const bool allowed = g_background_pad || !videoout::WindowHandle() || videoout::WindowHasFocus() || padshare::PickerInFront();
     if (allowed != g_pad_blocked) {
         return allowed; // sem mudanca (liberado e nao bloqueado, ou fora de foco e ja bloqueado)
     }
@@ -406,6 +413,49 @@ u32 PadHeldSinceFocus(u32 buttons) {
     }
     g_pad_held_mask &= buttons; // botao solto sai da mascara
     return g_pad_held_mask;
+}
+
+// Fase 80: jogador capturado pelo LegoToypad (hle_pad_share) = todos os aparelhos dele parados (sticks no centro,
+// gatilhos e botoes soltos; o teclado, no jogador do teclado). Ao ser liberado continua parado ate tudo voltar ao
+// repouso pelo menos uma vez: o B / botao que fechou o app nao vira um pulo, ataque ou pausa no jogo.
+std::atomic<bool> g_capture_hold[padsdl::kSlots];
+
+bool AtRest(const Input& in) {
+    const auto centered = [](u8 v) { return v >= 0x80 - 0x30 && v <= 0x80 + 0x30; };
+    return in.buttons == 0 && centered(in.lx) && centered(in.ly) && centered(in.rx) && centered(in.ry) && in.l2 < 30 && in.r2 < 30;
+}
+
+void StopRumble(int slot) {
+    if (padsdl::Count() == 0) {
+        XINPUT_VIBRATION off{};
+        XInputSetState(static_cast<DWORD>(slot), &off);
+    }
+    padsdl::Rumble(0, 0, slot);
+}
+
+bool PlayerHeld(int slot) {
+    return slot >= 0 && slot < padsdl::kSlots && g_capture_hold[slot].load(std::memory_order_relaxed);
+}
+
+// raw = o que os aparelhos do jogador mandam agora; true = a entrada dele fica neutra neste quadro.
+bool CaptureGate(int slot, const Input& raw) {
+    std::atomic<bool>& hold = g_capture_hold[slot];
+    if ((padshare::CapturedPlayers() >> slot) & 1) {
+        if (!hold.exchange(true)) {
+            StopRumble(slot);
+            log::Tagged("PAD", "t=%.1fs player %d: in LegoToypad, input neutral", Seconds(), slot + 1);
+        }
+        return true;
+    }
+    if (!hold.load()) {
+        return false;
+    }
+    if (!AtRest(raw)) {
+        return true; // ainda segurando o que fechou o app
+    }
+    hold = false;
+    log::Tagged("PAD", "t=%.1fs player %d: back from LegoToypad, input enabled", Seconds(), slot + 1);
+    return false;
 }
 
 // Testes (LD_PAD_LIVE=<arquivo>): linhas "botao:ms", "ls_up:ms" ou "wait:ms" acrescentadas ao arquivo entram
@@ -533,15 +583,13 @@ void ReadScript(Input& in, int player = 0) {
 // Fase 61 (co-op local): ha controle para a vaga (0 = jogador 1)? SDL primeiro; sem nenhum controle no SDL (ou com
 // --no-sdl-pad), o XInput do mesmo indice. XInputGetState num indice vazio e lento (o driver procura o aparelho):
 // vaga vazia e conferida de novo so a cada 2 s.
-bool SlotPresent(int slot) {
+// Fase 80: so o controle (o roster do LegoToypad precisa saber se ha um aparelho, sem contar o teclado).
+bool DevicePresent(int slot) {
     if (slot < 0 || slot >= padsdl::kSlots) {
         return false;
     }
     if (slot == 1 && std::getenv("LD_PAD_LIVE2")) {
         return true; // controle virtual do jogador 2 (testes)
-    }
-    if (slot == 1 && g_keyboard_player.load() == 1) {
-        return true; // 2.0.2: o teclado e o jogador 2
     }
     padsdl::State sdl;
     if (padsdl::Read(&sdl, slot)) {
@@ -563,30 +611,39 @@ bool SlotPresent(int slot) {
     return present[slot];
 }
 
+bool SlotPresent(int slot) {
+    if (slot == 1 && g_keyboard_player.load() == 1) {
+        return true; // 2.0.2: o teclado e o jogador 2
+    }
+    return DevicePresent(slot);
+}
+
 // Jogadores 2 a 4: so o controle da propria vaga (o teclado, os roteiros e o portal sao do jogador 1).
 bool ReadOtherPlayer(int slot, Input& in) {
     if (!SlotPresent(slot)) {
         return false;
     }
-    if (!PadFocusGate()) {
-        return true; // conectado, mas a janela do jogo nao esta na frente: parado
+    if (PadFocusGate()) { // senao: conectado, mas a janela do jogo nao esta na frente: parado
+        padsdl::State sdl;
+        if (padsdl::Read(&sdl, slot)) {
+            in.buttons |= sdl.buttons;
+            in.lx = sdl.lx;
+            in.ly = sdl.ly;
+            in.rx = sdl.rx;
+            in.ry = sdl.ry;
+            in.l2 = sdl.l2;
+            in.r2 = sdl.r2;
+        } else if (padsdl::Count() == 0) {
+            ReadXInput(in, static_cast<DWORD>(slot));
+        }
     }
-    padsdl::State sdl;
-    if (padsdl::Read(&sdl, slot)) {
-        in.buttons |= sdl.buttons;
-        in.lx = sdl.lx;
-        in.ly = sdl.ly;
-        in.rx = sdl.rx;
-        in.ry = sdl.ry;
-        in.l2 = sdl.l2;
-        in.r2 = sdl.r2;
-    } else if (padsdl::Count() == 0) {
-        ReadXInput(in, static_cast<DWORD>(slot));
+    if (slot == 1 && g_keyboard_player.load() == 1) {
+        ReadKeyboard(in, false); // 2.0.2 (o teclado tem o proprio teste de foco)
+    }
+    if (CaptureGate(slot, in)) { // Fase 80
+        in = Input{};
     }
     if (slot == 1) {
-        if (g_keyboard_player.load() == 1) {
-            ReadKeyboard(in, false); // 2.0.2
-        }
         ReadScript(in, 1);
     }
     return true;
@@ -595,6 +652,7 @@ bool ReadOtherPlayer(int slot, Input& in) {
 HLE_IMPL(int, scePadInit) {
     HLE_TRACE("");
     padsdl::Start(); // Fase 24.5: thread do SDL (DualShock 4, touchpad)
+    padshare::Start(); // Fase 80: entrada por jogador com o app LegoToypad
     return err::OK;
 }
 HLE_OVERRIDE(scePadInit);
@@ -686,6 +744,13 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     if (g_keyboard_player.load() == 0) {
         ReadKeyboard(in);
     }
+    // Fase 80: jogador 1 dentro do LegoToypad: controle, touchpad e (se for dele) teclado parados; os roteiros de teste
+    // continuam
+    bool touches = have_sdl;
+    if (CaptureGate(0, in)) {
+        in = Input{};
+        touches = false;
+    }
     ReadScript(in);
 
     // Menu de Configuracoes de Video (L3 + R3 no controle)
@@ -743,7 +808,7 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     data->r2 = in.r2;
     data->orientation[3] = 1.0f;  // quaternion identidade
     data->acceleration[1] = 1.0f; // controle parado sobre a mesa
-    if (have_sdl) { // toques do touchpad, no formato do ScePadData (+0x34)
+    if (touches) { // toques do touchpad, no formato do ScePadData (+0x34)
         data->touch_data.touch_num = sdl.touches;
         for (u32 i = 0; i < sdl.touches && i < 2; ++i) {
             data->touch_data.touch[i].x = sdl.touch[i].x;
@@ -794,6 +859,9 @@ HLE_IMPL(int, scePadSetVibration, int handle, const u8* params) {
     }
     if (params) {
         const int slot = handle - kPadHandle; // Fase 61: o controle do proprio jogador
+        if (PlayerHeld(slot)) { // Fase 80: no LegoToypad o controle nao vibra com o que o jogador nao ve
+            return err::OK;
+        }
         XINPUT_VIBRATION vibration{static_cast<WORD>(params[0] * 257), static_cast<WORD>(params[1] * 257)};
         if (padsdl::Count() == 0) {
             XInputSetState(static_cast<DWORD>(slot), &vibration);
@@ -812,6 +880,14 @@ void SetPadStickLog(bool enabled) {
 
 bool PadControllerPresent(int slot) { // Fase 61: usado pelo UserService (login / logout dos jogadores 2 a 4)
     return SlotPresent(slot);
+}
+
+bool PadDevicePresent(int slot) { // Fase 80: so o controle (roster do LegoToypad)
+    return DevicePresent(slot);
+}
+
+int PadKeyboardSlot() { // Fase 80: jogador do teclado (0 = jogador 1, 1 = jogador 2 depois do F2); -1 com --no-keyboard
+    return g_keyboard_enabled ? g_keyboard_player.load() : -1;
 }
 
 // 2.0.2: F2 = o teclado vira o jogador 2 (o jogo ve um segundo usuario entrar e mostra "aperte F2 ou qualquer botao"), e F2

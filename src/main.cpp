@@ -23,6 +23,7 @@
 #include "hle/overrides/hle_filesystem.h"
 #include "hle/overrides/hle_anomaly.h"
 #include "hle/overrides/hle_mods.h"
+#include "hle/overrides/hle_pad_share.h"
 #include "hle/overrides/hle_toypad.h"
 #include "hle/overrides/hle_videoout.h"
 #include "render/vulkan_backend.h"
@@ -1529,6 +1530,8 @@ int main(int argc, char** argv) {
             real_toypad = false; // Fase 61: mesmo com o portal fisico ligado, usa o virtual (portal.json / app)
         } else if (!std::strcmp(argv[i], "--toypad-port") && i + 1 < argc) {
             toypad_port = std::atoi(argv[++i]); // porta do listener do app LegoToypad (0 = desligado)
+        } else if (!std::strcmp(argv[i], "--no-toypad-share")) {
+            hle::padshare::SetEnabled(false); // Fase 80: sem entrada por jogador com o LegoToypad (volta ao tudo ou nada)
         } else if (!std::strcmp(argv[i], "--selftest")) {
             selftest = true;
         } else {

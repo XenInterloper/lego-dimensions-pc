@@ -78,6 +78,7 @@ The languages other than Portuguese and English need the game's original text fi
 - Fullscreen ("Fullscreen" option in the launcher, or F11 in game) and a window size selector ("Resolution"; the game still renders at 1920x1080 and is scaled to the window).
 - "Skip all cutscenes" option: any cutscene can be skipped, even the ones the game only lets you skip after watching them or at 100%.
 - The controller only drives the game while the game window is in front: clicking the Toy Pad app makes the character stop.
+- Per-player input with LegoToypad: a LegoToypad build that publishes which players have its picker open (`Local\LegoToypadInputOwnership`) only freezes those players; everyone else keeps playing while the picker is in front. The game publishes its player-to-controller table in `Local\LegoDimensionsInputRoster`. `--no-toypad-share` turns this off. Older LegoToypad builds keep the all-or-nothing behaviour above.
 - The first time you visit a new area the graphics driver still compiles pipelines. That can cause a short hitch, but objects never disappear (no pop-in).
 - Very heavy scenes (~6000 draws per frame) run below 60 fps on 6-core CPUs.
 - Some outdoor scenes (for example the aerial shot of Metropolis) have much heavier fog than on the PS4. Under investigation.

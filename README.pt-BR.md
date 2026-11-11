@@ -50,6 +50,7 @@ Detalhes e dicas no [LEIA-ME](tools/dist/LEIA-ME.txt).
 - Tela cheia (opção "Tela cheia" no launcher ou F11 no jogo) e seletor do tamanho da janela ("Resolução"; o jogo continua desenhando em 1920x1080 e é escalado para a janela).
 - Opção "Pular todas as cutscenes": qualquer cutscene pode ser pulada, mesmo as que o jogo só deixa pular depois de vistas ou com 100%.
 - O controle só mexe no jogo com a janela do jogo na frente: ao clicar no app do Toy Pad, o personagem para.
+- Entrada por jogador com o LegoToypad: uma versão do LegoToypad que publica quais jogadores estão com o seletor aberto (`Local\LegoToypadInputOwnership`) só para esses jogadores; os outros continuam jogando com o seletor na frente. O jogo publica a tabela jogador / controle em `Local\LegoDimensionsInputRoster`. `--no-toypad-share` desliga. Versões antigas do LegoToypad continuam com o tudo ou nada acima.
 - Launcher, instalador e telas do port em português ou inglês, conforme o idioma do Windows. O seletor **Idioma** do launcher escolhe na mão (português, inglês, espanhol, francês, alemão, italiano, holandês, dinamarquês); os idiomas fora português e inglês precisam dos textos originais do jogo (um dump com tradução de fã no `text.csv` fecha o jogo nesses idiomas).
 - Na primeira visita a uma área nova o driver de vídeo ainda compila pipelines. Isso pode dar um engasgo curto, mas os objetos não somem (sem pop-in).
 - Cenas muito pesadas (~6000 draws por quadro) ficam abaixo de 60 fps em processadores de 6 núcleos.

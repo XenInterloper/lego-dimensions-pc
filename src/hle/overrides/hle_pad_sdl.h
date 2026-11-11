@@ -32,4 +32,14 @@ const char* Name(int slot = 0);             // nome do controle da vaga ("" se n
 // Fase 62: icones que combinam com o controle da vaga: "ps4", "ps3", "360", "xboxone", "wiiu" ("" se nenhum)
 const char* IconPlatform(int slot = 0);
 
+// Fase 80: identidade do controle da vaga, para o roster do LegoToypad (hle_pad_share).
+struct Device {
+    s32 instance_id = -1; // id de instancia do SDL (so vale neste processo)
+    u8 guid[16]{};
+    u16 vendor = 0, product = 0;
+    char path[256] = ""; // SDL_GetGamepadPath: caminho HID ou "XInput#N"
+    char name[96] = "";
+};
+bool GetDevice(int slot, Device* out); // false se a vaga nao tem controle aberto pelo SDL
+
 } // namespace hle::padsdl
