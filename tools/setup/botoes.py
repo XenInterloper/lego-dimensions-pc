@@ -11,8 +11,11 @@ destas na hora de enviar para a GPU, conforme o controle ligado (ou a opcao do l
 Saida em assets\\buttons\\: <plataforma>.rgba (608x608 RGBA8, sem cabecalho) para ps4 ps3 360 xboxone wiiu, e
 ps4_dxt5.hash (hash FNV-1a 64 dos blocos DXT5 da folha do PS4, para o port reconhecer a textura).
 2.0.2: tambem keyboard.rgba, as teclas do port (teclado.py) escritas com a fonte do proprio jogo (\\gui\\font\\font_nxg.ft2).
+Fase 81: com as teclas do jogador (--keys, a assinatura de teclado.py); --keyboard-only refaz so essa folha, do cache que a
+rodada completa deixa (keyboard_src.json / keyboard_font.bin), sem ler os .DAT.
 
-uso: botoes.py --app0 <pasta do jogo> [--patch <pasta da atualizacao>] [--png]   (--png: copias para conferir)
+uso: botoes.py --app0 <pasta do jogo> [--patch <pasta da atualizacao>] [--png] [--keys <assinatura>] [--keyboard-only]
+     (--png: copias para conferir)
 """
 import argparse
 import collections
@@ -169,7 +172,16 @@ def main():
     parser.add_argument('--app0', required=True)
     parser.add_argument('--patch', default='')
     parser.add_argument('--png', action='store_true')
+    parser.add_argument('--keys', default='')
+    parser.add_argument('--keyboard-only', action='store_true')
     args = parser.parse_args()
+    if args.keyboard_only:
+        cached = teclado.load_cache(OUT, decode_dxt)
+        if cached:
+            teclado.write_keyboard(OUT, cached[0], cached[1], args.keys, write_png if args.png else None)
+            print('icons keyboard ready (cache)', flush=True)
+            return 0
+        print('icons keyboard: no cache, reading the .DAT archives', flush=True)
     found = {}   # plataforma -> (pacote, dados); o da atualizacao (PATCH*) vence
     names = {}
     errors = collections.Counter()
@@ -222,11 +234,8 @@ def main():
     if font is None:
         print('WARNING game font not found: no keyboard icons', flush=True)
     else:
-        image = teclado.compose_keyboard(ps4, font)
-        with open(os.path.join(OUT, 'keyboard.rgba'), 'wb') as f:
-            f.write(b''.join(bytes(row) for row in image))
-        if args.png:
-            write_png(os.path.join(OUT, 'keyboard.png'), image, w4, h4)
+        teclado.save_cache(OUT, ps4, font)
+        teclado.write_keyboard(OUT, ps4, font, args.keys, write_png if args.png else None)
         print('icons keyboard ready', flush=True)
     return 0
 

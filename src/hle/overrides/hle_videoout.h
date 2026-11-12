@@ -87,6 +87,11 @@ void ToggleLogsMenu();
 bool IsLogsMenuOpen();
 void HandleLogsMenuController(u32 pressed_buttons);
 
+// Fase 81: menu de controles do teclado dentro do jogo (F3): o mesmo da aba Controles do launcher (teclas, jogador do
+// teclado, camera pelo mouse). Teclado e mouse; a entrada do jogador 1 fica parada enquanto esta aberto.
+void ToggleControlsMenu();
+bool IsControlsMenuOpen();
+
 // true se a janela do jogo existe e esta em primeiro plano (o teclado so vale nesse caso).
 bool WindowHasFocus();
 // HWND da janela do jogo (nullptr se nao ha janela): dona dos dialogos do port.

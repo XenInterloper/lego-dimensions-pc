@@ -1631,6 +1631,8 @@ struct IconSheets {
 std::atomic<u64> g_icon_address{0}; // textura do jogo reconhecida como a folha de icones
 std::atomic<int> g_icon_applied{-1}; // plataforma que esta na GPU agora
 u64 g_icon_next_check = 0;           // so a thread de render
+// Fase 81: o menu F3 mudou as teclas e botoes.py refez keyboard.rgba: a thread de render rele a folha e reenvia
+std::atomic<bool> g_keyboard_icons_reload{false};
 
 int IconIndex(const char* name) {
     for (int i = 0; i < kIconPlatformCount; ++i) {
@@ -2112,6 +2114,18 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
     if (texture.address == g_icon_address.load(std::memory_order_relaxed) && g_texture_frame >= g_icon_next_check) {
         // Fase 62: o controle (ou a opcao) mudou: a folha de icones que esta na GPU e reescrita com a outra plataforma
         g_icon_next_check = g_texture_frame + 30;
+        if (g_keyboard_icons_reload.exchange(false) && g_icons.ok) {
+            const std::filesystem::path dir = std::filesystem::path(render::GameSpirvDirectory()).parent_path() / "buttons";
+            std::ifstream in(dir / "keyboard.rgba", std::ios::binary);
+            std::vector<u8> fresh{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+            if (fresh.size() == static_cast<size_t>(g_icons.width) * g_icons.height * 4) {
+                g_icons.rgba[kKeyboardIcons].swap(fresh);
+                if (g_icon_applied.load() == kKeyboardIcons) {
+                    g_icon_applied = -1; // reenvia abaixo
+                }
+                log::Tagged("ICONS", "keyboard icons reloaded (new keys)");
+            }
+        }
         const int wanted = WantedIconPlatform();
         if (wanted != g_icon_applied.load() && !g_icons.rgba[wanted].empty() && renderer.HasTexture(key)) {
             render::TextureData data;
@@ -7659,6 +7673,10 @@ void SetPreloadAllAot(bool enabled) {
 
 void SetButtonIcons(const char* name) { // Fase 62: "auto" ou uma das plataformas
     g_icons_forced = IconIndex(name);
+}
+
+void ReloadKeyboardIcons() { // Fase 81: hle_pad.cpp, depois de refazer as dicas de teclado
+    g_keyboard_icons_reload = true;
 }
 
 void SetPairBudget(double budget_ms) {

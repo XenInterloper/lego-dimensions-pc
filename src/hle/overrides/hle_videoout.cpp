@@ -41,6 +41,7 @@
 #include "hle/overrides/hle_equeue.h"
 #include "hle/overrides/hle_filesystem.h"
 #include "hle/overrides/hle_override.h"
+#include "hle/overrides/hle_pad_keys.h"
 #include "hle/hle_log.h"
 #include "runtime/crash_handler.h"
 #include "runtime/hwmon.h"
@@ -55,7 +56,7 @@ std::string GetDiagnosticsSummary(bool pt);
 int ForceStopActive();
 }
 namespace hle {
-bool TogglePadKeyboardPlayer(); // hle_pad.cpp (2.0.2: F2)
+bool TapInPadKeyboardPlayer(); // hle_pad.cpp (Fase 81: F2 = o jogador do teclado entra)
 }
 
 namespace hle::videoout {
@@ -129,6 +130,14 @@ std::atomic<bool> g_stats_overlay{false};
 std::atomic<bool> g_video_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 std::atomic<bool> g_logs_overlay_open{false};
+// Fase 81: menu de controles do teclado (F3). So a thread da janela mexe; o overlay le.
+std::atomic<bool> g_controls_menu_open{false};
+std::atomic<int> g_controls_sel{0};
+std::atomic<int> g_controls_capture{-1}; // esperando a tecla desta acao
+bool g_controls_dirty = false;           // teclas mudaram: refazer as dicas de teclado ao fechar
+std::mutex g_controls_note_mutex;
+std::string g_controls_note;             // aviso (tecla reservada, tecla tirada de outra acao)
+bool g_cursor_clipped = false;           // camera pelo mouse: ponteiro preso e escondido na janela
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
@@ -423,12 +432,223 @@ static void InitMenuDefaults() {
 
 } // namespace
 
+// ---- Fase 81: menu de controles (F3), o mesmo da aba Controles do launcher ----
+// Linhas: 0 = jogador do teclado, 1 = camera pelo mouse, 2 = sensibilidade; depois as acoes em duas colunas de
+// kControlsKeyRows; por ultimo "restaurar padrao". Cada mudanca ja vale e ja vai para o launcher.ini.
+namespace {
+
+constexpr int kControlsSettings = 3;
+constexpr int kControlsKeyRows = 12;
+
+int ControlsResetRow() {
+    return kControlsSettings + padkeys::ActionCount();
+}
+
+void SetControlsNote(std::string text) {
+    std::lock_guard lock(g_controls_note_mutex);
+    g_controls_note = std::move(text);
+}
+
+std::string ControlsNote() {
+    std::lock_guard lock(g_controls_note_mutex);
+    return g_controls_note;
+}
+
+const char* ActionLabel(int i) {
+    const padkeys::Action& action = padkeys::GetAction(i);
+    return lang::Pt() ? action.label_pt : action.label;
+}
+
+void CloseControlsMenu() {
+    if (!g_controls_menu_open.exchange(false)) {
+        return;
+    }
+    g_controls_capture = -1;
+    SetControlsNote("");
+    if (g_controls_dirty) {
+        g_controls_dirty = false;
+        padkeys::RefreshIcons(); // as dicas "(Space)", "(K)"... com as teclas novas
+    }
+    log::Tagged("CONTROLS-MENU", "closed");
+}
+
+void ChangeControlsSetting(int row, int step, bool wrap) {
+    if (row == 0) {
+        padkeys::SetKeyboardPlayer(padkeys::KeyboardPlayer() == 1 ? 0 : 1);
+    } else if (row == 1) {
+        padkeys::SetMouseLook(!padkeys::MouseLook());
+        g_controls_dirty = true; // a dica do analogico direito vira "(Mouse)"
+    } else {
+        int value = padkeys::MouseSensitivity() + step;
+        if (wrap && value > 10) {
+            value = 1;
+        }
+        padkeys::SetMouseSensitivity(value);
+    }
+    padkeys::Save();
+}
+
+// WM_KEYDOWN so diz "Shift" / "Ctrl" / "Alt": o lado vem do codigo de varredura / do bit "estendida".
+int SpecificKey(WPARAM wp, LPARAM lp) {
+    const UINT scan = (lp >> 16) & 0xFF;
+    const bool extended = (lp >> 24) & 1;
+    switch (wp) {
+    case VK_SHIFT: return static_cast<int>(MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX));
+    case VK_CONTROL: return extended ? VK_RCONTROL : VK_LCONTROL;
+    case VK_MENU: return extended ? VK_RMENU : VK_LMENU;
+    default: return static_cast<int>(wp);
+    }
+}
+
+// Uma tecla / botao do mouse para a acao que espera. Repetida em outra acao, sai de la (cada tecla faz uma coisa so).
+void AssignControlsKey(int vk) {
+    const int action = g_controls_capture.load();
+    if (action < 0 || vk <= 0 || vk >= 256) {
+        return;
+    }
+    char name[64];
+    padkeys::KeyName(vk, name, sizeof(name));
+    if (padkeys::Reserved(vk)) {
+        SetControlsNote(std::string(name) + (lang::Pt() ? " E UM ATALHO DO JOGO / DO WINDOWS: ESCOLHA OUTRA TECLA."
+                                                        : " IS A GAME / WINDOWS SHORTCUT: CHOOSE ANOTHER KEY."));
+        return;
+    }
+    const int other = padkeys::TakenBy(vk, action);
+    SetControlsNote(other < 0 ? std::string()
+                              : std::string(name) + (lang::Pt() ? " SAIU DE " : " WAS REMOVED FROM ") + ActionLabel(other) + ".");
+    padkeys::SetBinding(action, vk);
+    padkeys::Save();
+    g_controls_dirty = true;
+    g_controls_capture = -1;
+    log::Tagged("CONTROLS-MENU", "%s = %s", padkeys::GetAction(action).name, name);
+}
+
+void HandleControlsKey(WPARAM wp, LPARAM lp) {
+    const bool repeat = (lp >> 30) & 1;
+    if (g_controls_capture.load() >= 0) {
+        if (!repeat) {
+            AssignControlsKey(SpecificKey(wp, lp)); // Esc, Enter, setas... tambem viram tecla aqui
+        }
+        return;
+    }
+    const int keys = padkeys::ActionCount();
+    const int reset = ControlsResetRow();
+    int sel = g_controls_sel.load();
+    const bool in_keys = sel >= kControlsSettings && sel < reset;
+    const int k = sel - kControlsSettings;
+    const int column = k / kControlsKeyRows, row = k % kControlsKeyRows;
+    switch (wp) {
+    case VK_UP:
+        if (sel == 0) {
+            sel = reset;
+        } else if (sel < kControlsSettings) {
+            --sel;
+        } else if (in_keys) {
+            sel = row == 0 ? kControlsSettings - 1 : sel - 1;
+        } else {
+            sel = kControlsSettings + kControlsKeyRows - 1; // de "restaurar" para a ultima tecla da 1a coluna
+        }
+        break;
+    case VK_DOWN:
+        if (sel < kControlsSettings) {
+            ++sel; // da sensibilidade (2) cai na primeira tecla (3)
+        } else if (in_keys) {
+            sel = (row == kControlsKeyRows - 1 || k + 1 >= keys) ? reset : sel + 1;
+        } else {
+            sel = 0;
+        }
+        break;
+    case VK_LEFT:
+    case VK_RIGHT:
+        if (sel < kControlsSettings) {
+            ChangeControlsSetting(sel, wp == VK_RIGHT ? 1 : -1, false);
+        } else if (in_keys) {
+            const int other = (1 - column) * kControlsKeyRows + row;
+            if (other < keys) {
+                sel = kControlsSettings + other;
+            }
+        }
+        break;
+    case VK_RETURN:
+        if (repeat) {
+            break;
+        }
+        if (sel < kControlsSettings) {
+            ChangeControlsSetting(sel, 1, true);
+        } else if (in_keys) {
+            g_controls_capture = k;
+            SetControlsNote("");
+        } else {
+            padkeys::ResetBindings();
+            padkeys::Save();
+            g_controls_dirty = true;
+            SetControlsNote(lang::Pt() ? "TECLAS PADRAO RESTAURADAS." : "DEFAULT KEYS RESTORED.");
+        }
+        break;
+    case VK_DELETE:
+    case VK_BACK:
+        if (in_keys) {
+            padkeys::SetBinding(k, 0);
+            padkeys::Save();
+            g_controls_dirty = true;
+        }
+        break;
+    case VK_ESCAPE:
+        CloseControlsMenu();
+        break;
+    default:
+        break;
+    }
+    g_controls_sel = sel;
+}
+
+// Camera pelo mouse: com a janela na frente e nenhum menu do port aberto, o ponteiro fica preso e escondido na area do
+// jogo (senao ele sai da janela e um clique cai em outro programa). Alt+Tab, outro menu ou desligar a opcao soltam.
+void UpdateMouseCapture(HWND hwnd, bool force = false) {
+    const bool want = padkeys::MouseLook() && GetForegroundWindow() == hwnd && !IsIconic(hwnd) && !g_video_menu_open.load() &&
+                      !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !g_controls_menu_open.load();
+    if (want == g_cursor_clipped && !force) {
+        return;
+    }
+    if (want) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&rc), 2);
+        ClipCursor(&rc);
+        SetCursor(nullptr);
+    } else if (g_cursor_clipped) {
+        ClipCursor(nullptr);
+    }
+    g_cursor_clipped = want;
+}
+
+} // namespace
+
+void ToggleControlsMenu() {
+    if (g_controls_menu_open.load()) {
+        CloseControlsMenu();
+        return;
+    }
+    g_video_menu_open = false;
+    g_achievements_overlay_open = false;
+    g_logs_overlay_open = false;
+    g_controls_capture = -1;
+    SetControlsNote("");
+    g_controls_menu_open = true;
+    log::Tagged("CONTROLS-MENU", "open");
+}
+
+bool IsControlsMenuOpen() {
+    return g_controls_menu_open.load();
+}
+
 void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
     const bool next = !g_video_menu_open.load();
     if (next) {
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
+        CloseControlsMenu();
     }
     g_video_menu_open = next;
     log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "open" : "closed");
@@ -483,6 +703,7 @@ void ToggleAchievementsMenu() {
     if (next) {
         g_video_menu_open = false;
         g_logs_overlay_open = false;
+        CloseControlsMenu();
     }
     g_achievements_overlay_open = next;
     log::Tagged("ACHIEVEMENTS-MENU", "%s", g_achievements_overlay_open ? "open" : "closed");
@@ -580,6 +801,7 @@ void ToggleLogsMenu() {
     if (next) {
         g_video_menu_open = false;
         g_achievements_overlay_open = false;
+        CloseControlsMenu();
         hle::log::FlushCapture();
         g_logs_auto_follow = true;
         const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
@@ -693,13 +915,58 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (!render::VulkanRenderer::Instance().Active()) {
             InvalidateRect(hwnd, nullptr, FALSE); // sem Vulkan: redesenha o texto por GDI
         }
+        UpdateMouseCapture(hwnd); // Fase 81: um menu abriu / fechou sem o mouse mexer
         return 0;
     }
     case WM_SIZE:
         if (wparam != SIZE_MINIMIZED && render::VulkanRenderer::Instance().Active()) {
             render::VulkanRenderer::Instance().RequestSwapchainRebuild();
         }
+        UpdateMouseCapture(hwnd, g_cursor_clipped);
         return 0;
+    case WM_MOVE:
+        UpdateMouseCapture(hwnd, g_cursor_clipped);
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_ACTIVATE: // Fase 81: perdeu a frente = solta o ponteiro; voltou = prende de novo (camera pelo mouse)
+        if (LOWORD(wparam) == WA_INACTIVE) {
+            if (g_cursor_clipped) {
+                ClipCursor(nullptr);
+                g_cursor_clipped = false;
+            }
+        } else {
+            UpdateMouseCapture(hwnd, true);
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_INPUT: { // Fase 81: movimento cru do mouse (camera pelo mouse)
+        RAWINPUT raw;
+        UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+            raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            UpdateMouseCapture(hwnd);
+            if (g_cursor_clipped) {
+                padkeys::OnRawMouse(raw.data.mouse.lLastX, raw.data.mouse.lLastY);
+            }
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    }
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN: // Fase 81: menu F3 esperando uma tecla: o botao do mouse vira a tecla
+        if (g_controls_menu_open.load() && g_controls_capture.load() >= 0) {
+            AssignControlsKey(msg == WM_LBUTTONDOWN   ? VK_LBUTTON
+                              : msg == WM_RBUTTONDOWN ? VK_RBUTTON
+                              : msg == WM_MBUTTONDOWN ? VK_MBUTTON
+                              : GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2);
+            return msg == WM_XBUTTONDOWN ? TRUE : 0;
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_SYSKEYDOWN: // Fase 81: Alt (e F10) no menu F3 esperando uma tecla
+        if (g_controls_menu_open.load() && g_controls_capture.load() >= 0 && wparam != VK_F4) {
+            HandleControlsKey(wparam, lparam);
+            return 0;
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
@@ -725,8 +992,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleVideoSettingsMenu();
             return 0;
         }
-        if (wparam == VK_F2 && !(lparam & (1 << 30)) && !g_video_menu_open.load()) {
-            TogglePadKeyboardPlayer();
+        if (wparam == VK_F2 && !(lparam & (1 << 30)) && !g_video_menu_open.load() && !g_controls_menu_open.load()) {
+            TapInPadKeyboardPlayer(); // Fase 81: o jogador do teclado entra (nao troca mais de jogador)
+            return 0;
+        }
+        if (wparam == VK_F3 && !(lparam & (1 << 30))) { // Fase 81: menu de controles; esperando tecla, F3 desiste
+            if (g_controls_menu_open.load() && g_controls_capture.load() >= 0) {
+                g_controls_capture = -1;
+                SetControlsNote("");
+            } else {
+                ToggleControlsMenu();
+            }
+            UpdateMouseCapture(hwnd);
             return 0;
         }
         if (wparam == VK_F8 && !(lparam & (1 << 30))) {
@@ -735,6 +1012,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         if (wparam == VK_F9 && !(lparam & (1 << 30))) {
             ToggleLogsMenu();
+            return 0;
+        }
+        if (g_controls_menu_open.load()) {
+            HandleControlsKey(wparam, lparam);
             return 0;
         }
         if (g_logs_overlay_open.load()) {
@@ -879,7 +1160,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return DefWindowProcA(hwnd, msg, wparam, lparam);
     }
     case WM_SETCURSOR:
-        if (g_fullscreen && LOWORD(lparam) == HTCLIENT) {
+        if ((g_fullscreen || g_cursor_clipped) && LOWORD(lparam) == HTCLIENT) {
             SetCursor(nullptr);
             return TRUE;
         }
@@ -947,6 +1228,13 @@ void WindowThread() {
         return;
     }
     g_hwnd.store(hwnd);
+    {
+        // Fase 81: movimento cru do mouse (WM_INPUT) para a camera pelo mouse; so chega com a janela na frente
+        RAWINPUTDEVICE mouse{0x01, 0x02, 0, hwnd};
+        if (!RegisterRawInputDevices(&mouse, 1, sizeof(mouse))) {
+            log::Tagged("PAD", "raw mouse input not available (error %lu): no mouse camera", GetLastError());
+        }
+    }
     if (g_start_fullscreen.load()) {
         SetFullscreen(hwnd, true);
     }
@@ -2064,7 +2352,7 @@ void QueueStatsOverlay() {
         }
     }
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_achievements_overlay_open.load() &&
-        !g_logs_overlay_open.load() && !has_toast) {
+        !g_logs_overlay_open.load() && !g_controls_menu_open.load() && !has_toast) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -2180,6 +2468,88 @@ void QueueStatsOverlay() {
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }
+    }
+
+    if (g_controls_menu_open.load()) { // Fase 81: menu F3
+        constexpr u32 kBg = 0xEE121216, kBorder = 0xFF00D000, kTitleYellow = 0xFF00E0FF, kHiBg = 0xAA303038;
+        constexpr u32 kWhite = 0xFFFFFFFF, kGray = 0xFFA0A0A0, kCyan = 0xFFE0C040, kAmber = 0xFF40B0FF;
+        const bool pt = lang::Pt();
+        const float s = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
+        const float box_w = 920.0f * s, box_h = 700.0f * s;
+        const float x0 = (client.right - box_w) / 2.0f, y0 = (client.bottom - box_h) / 2.0f;
+        const float x1 = x0 + box_w, y1 = y0 + box_h;
+        c.Rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, kBorder);
+        c.Rect(x0, y0, x1, y1, kBg);
+        const std::string title = pt ? "CONTROLES DO TECLADO" : "KEYBOARD CONTROLS";
+        const float font_title = 3.5f * s;
+        c.Write(title, x0 + (box_w - TextWidth(title, font_title)) / 2.0f, y0 + 20.0f * s, font_title, kTitleYellow);
+        c.Rect(x0 + 20.0f * s, y0 + 55.0f * s, x1 - 20.0f * s, y0 + 57.0f * s, kGray);
+
+        const int sel = g_controls_sel.load();
+        const int capture = g_controls_capture.load();
+        const float font_item = 2.4f * s;
+        float y = y0 + 70.0f * s;
+        char sens[16];
+        std::snprintf(sens, sizeof(sens), "< %d >", padkeys::MouseSensitivity());
+        const std::string player = padkeys::KeyboardPlayer() == 1 ? (pt ? "< JOGADOR 2 >" : "< PLAYER 2 >") : (pt ? "< JOGADOR 1 >" : "< PLAYER 1 >");
+        const std::string settings[kControlsSettings][2] = {
+            {pt ? "JOGADOR DO TECLADO E DO MOUSE" : "KEYBOARD AND MOUSE PLAYER", player},
+            {pt ? "MOUSE MOVE A CAMERA (ANALOGICO DIREITO)" : "MOUSE MOVES THE CAMERA (RIGHT STICK)", padkeys::MouseLook() ? "[X]" : "[ ]"},
+            {pt ? "SENSIBILIDADE DO MOUSE" : "MOUSE SENSITIVITY", sens},
+        };
+        for (int i = 0; i < kControlsSettings; ++i) {
+            const bool on = sel == i;
+            if (on) {
+                c.Rect(x0 + 16.0f * s, y - 4.0f * s, x1 - 16.0f * s, y + 26.0f * s, kHiBg);
+            }
+            const bool dim = i == 2 && !padkeys::MouseLook();
+            c.Write((on ? "> " : "  ") + settings[i][0], x0 + 24.0f * s, y, font_item, on ? kTitleYellow : dim ? kGray : kWhite);
+            c.Write(settings[i][1], x1 - TextWidth(settings[i][1], font_item) - 32.0f * s, y, font_item, on ? kCyan : kGray);
+            y += 34.0f * s;
+        }
+        c.Rect(x0 + 20.0f * s, y0 + 176.0f * s, x1 - 20.0f * s, y0 + 177.0f * s, kGray);
+
+        const float font_key = 2.0f * s, row_h = 30.0f * s, grid_y = y0 + 188.0f * s;
+        const float col_w = (box_w - 48.0f * s) / 2.0f;
+        for (int k = 0; k < padkeys::ActionCount(); ++k) {
+            const int column = k / kControlsKeyRows, row = k % kControlsKeyRows;
+            const float cx = x0 + 24.0f * s + column * col_w, cy = grid_y + row * row_h;
+            const bool on = sel == kControlsSettings + k;
+            if (on || capture == k) {
+                c.Rect(cx - 8.0f * s, cy - 6.0f * s, cx + col_w - 16.0f * s, cy + row_h - 8.0f * s, kHiBg);
+            }
+            c.Write(ActionLabel(k), cx, cy, font_key, on ? kTitleYellow : kWhite);
+            const int vk = padkeys::Binding(k);
+            char name[64];
+            if (capture == k) {
+                std::snprintf(name, sizeof(name), "%s", pt ? "APERTE UMA TECLA..." : "PRESS A KEY...");
+            } else {
+                padkeys::KeyName(vk, name, sizeof(name));
+            }
+            c.Write(name, cx + col_w - 26.0f * s - TextWidth(name, font_key), cy, font_key,
+                    capture == k ? kAmber : !vk ? kGray : on ? kCyan : kWhite);
+        }
+        const float reset_y = grid_y + kControlsKeyRows * row_h + 6.0f * s;
+        const bool reset_on = sel == ControlsResetRow();
+        if (reset_on) {
+            c.Rect(x0 + 16.0f * s, reset_y - 4.0f * s, x1 - 16.0f * s, reset_y + 26.0f * s, kHiBg);
+        }
+        const std::string reset = std::string(reset_on ? "> " : "  ") + (pt ? "RESTAURAR TECLAS PADRAO" : "RESET TO DEFAULT KEYS");
+        c.Write(reset, x0 + 24.0f * s, reset_y, font_item, reset_on ? kTitleYellow : kWhite);
+        const std::string note = ControlsNote();
+        if (!note.empty()) {
+            const float font_note = 1.8f * s;
+            c.Write(note, x0 + (box_w - TextWidth(note, font_note)) / 2.0f, reset_y + 40.0f * s, font_note, kAmber);
+        }
+
+        c.Rect(x0 + 20.0f * s, y1 - 64.0f * s, x1 - 20.0f * s, y1 - 62.0f * s, kGray);
+        const float font_foot = 1.7f * s;
+        const std::string foot1 = capture >= 0
+            ? (pt ? "[QUALQUER TECLA OU BOTAO DO MOUSE] ESCOLHER  [F3] DESISTIR" : "[ANY KEY OR MOUSE BUTTON] ASSIGN  [F3] CANCEL")
+            : (pt ? "[SETAS] NAVEGAR  [ENTER] MUDAR  [DEL] SEM TECLA  [ESC/F3] SAIR" : "[ARROWS] SELECT  [ENTER] CHANGE  [DEL] CLEAR  [ESC/F3] CLOSE");
+        const std::string foot2 = pt ? "SALVO NA HORA. F2: O JOGADOR DO TECLADO ENTRA NO JOGO." : "SAVED RIGHT AWAY. F2: THE KEYBOARD PLAYER JOINS THE GAME.";
+        c.Write(foot1, x0 + (box_w - TextWidth(foot1, font_foot)) / 2.0f, y1 - 50.0f * s, font_foot, kGray);
+        c.Write(foot2, x0 + (box_w - TextWidth(foot2, font_foot)) / 2.0f, y1 - 28.0f * s, font_foot, kGray);
     }
 
     if (g_video_menu_open.load() && g_menu_selected == 8) {

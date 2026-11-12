@@ -51,8 +51,8 @@ constexpr uint8_t kSlotKindKeyboard = 1;   // so teclado (o jogador do teclado s
 constexpr uint8_t kSlotKindController = 2; // controle (o jogador do teclado tambem tem o teclado: ver kSlotFlagKeyboard)
 constexpr uint8_t kSlotKindVirtual = 3;    // controle de teste (LD_PAD_LIVE2), sem aparelho
 
-constexpr uint8_t kSlotFlagKeyboard = 1u << 0; // o teclado e deste jogador: o 1 ou, depois do F2 no jogo
-                                               // (2.0.2), o 2; nenhum com --no-keyboard
+constexpr uint8_t kSlotFlagKeyboard = 1u << 0; // o teclado e deste jogador: o 1 ou o 2 (Fase 81: aba Controles do
+                                               // launcher ou F3 no jogo); nenhum com --no-keyboard
 constexpr uint8_t kSlotFlagSdl = 1u << 1;      // controle aberto pelo SDL3 do jogo (guid / path / vid / pid valem)
 constexpr uint8_t kSlotFlagXInput = 1u << 2;   // controle lido pelo XInput (xinputIndex vale)
 

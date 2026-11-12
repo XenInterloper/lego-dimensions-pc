@@ -248,7 +248,7 @@ void PublishRoster(ULONGLONG now) {
         if (i == 0) { // o jogador 1 sempre existe
             slot.connected = 1;
         }
-        if (i == keyboard_slot) { // o teclado e do jogador 1 ou, depois do F2 (2.0.2), do 2
+        if (i == keyboard_slot) { // o teclado e do jogador 1 ou do 2 (Fase 81: launcher.ini ou F3)
             slot.connected = 1;
             slot.flags |= kSlotFlagKeyboard;
         }
