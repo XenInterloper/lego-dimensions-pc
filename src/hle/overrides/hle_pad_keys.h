@@ -21,6 +21,7 @@ const Action& GetAction(int i);
 int Binding(int i);               // codigo de tecla virtual do Windows (mouse: 1, 2, 4, 5, 6); 0 = sem tecla
 void SetBinding(int i, int vk);   // a mesma tecla em outra acao sai de la
 int TakenBy(int vk, int except);  // a acao que ja usa a tecla (-1 = nenhuma)
+bool MouseButtonBound();          // alguma acao esta num botao do mouse (o ponteiro fica preso na janela)
 void ResetBindings();
 
 int KeyboardPlayer();             // 0 = jogador 1, 1 = jogador 2

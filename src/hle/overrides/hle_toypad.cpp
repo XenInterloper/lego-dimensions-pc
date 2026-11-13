@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <cstdio>
 #include <fstream>
@@ -117,14 +118,17 @@ void SavePortalStateLocked(const std::filesystem::path& path = {}) {
 // Fase 60: estado dos LEDs de cada zona (0 = centro, 1 = esquerda, 2 = direita), como no listener do Cemu
 // "Remote Toypad" que o app LegoToypad le: o app anima piscadas e fades sozinho a partir deste estado.
 // Tempos em "ticks" do portal (~40 ms cada), como chegam do jogo.
+// Fase 82: `count` 0 = repete ate o proximo comando; senao, uma quantidade finita (nas piscadas, FASES: aceso, apagado,
+// aceso...; impar termina na cor nova, par volta na antiga). `from` = a cor antiga (a que estava na zona).
 struct LedState {
     u8 pad = 0, mode = 0; // mode: 0 apagado, 1 cor fixa, 2 piscando, 3 fade
     u8 r = 0, g = 0, b = 0;
-    u8 from_r = 0, from_g = 0, from_b = 0; // cor de onde o fade parte (a que estava acesa)
+    u8 from_r = 0, from_g = 0, from_b = 0; // cor que estava na zona (de onde o fade parte / para onde a piscada volta)
     u8 on = 0, off = 0, count = 0, speed = 0;
+    u8 restart = 0;                         // Fase 82: +1 (mod 16) a cada comando, igual ou nao: o app recomeca a animacao
 };
 LedState g_led[kPadCount];
-u8 g_led_counter = 0; // muda a cada estado novo (o app so redesenha quando muda)
+u8 g_led_counter = 0; // muda a cada comando aplicado (o app so redesenha quando muda)
 
 u8 LedRandomByte() {
     static u32 state = 0x2545F491u; // independente do gerador do desafio do portal
@@ -135,20 +139,23 @@ u8 LedRandomByte() {
 }
 
 // pad: 1 centro, 2 esquerda, 3 direita, 0 todas.
+// Fase 82: todo comando conta, mesmo igual ao anterior: o portal recomeca a piscada / o fade quando o mesmo comando chega
+// de novo, e o jogo conta com isso (ex.: a mesma piscada de erro duas vezes). Antes o segundo era ignorado.
 void SetLed(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on, u8 off, u8 count, u8 speed) {
     auto apply = [&](u8 target) {
         if (target < 1 || target > kPadCount) {
             return;
         }
         LedState& state = g_led[target - 1];
-        if (state.pad == target && state.mode == mode && state.r == r && state.g == g && state.b == b && state.on == on && state.off == off &&
-            state.count == count && state.speed == speed) {
-            return; // nada mudou
-        }
-        if (mode == 3) { // fade: parte da cor que estava na zona
-            state.from_r = state.r;
-            state.from_g = state.g;
-            state.from_b = state.b;
+        if (mode == 2 || mode == 3) {
+            // a cor que esta na zona agora: com uma piscada rodando, a de antes dela (a de repouso)
+            const bool flashing = state.mode == 2;
+            const u8 shown_r = flashing ? state.from_r : state.r;
+            const u8 shown_g = flashing ? state.from_g : state.g;
+            const u8 shown_b = flashing ? state.from_b : state.b;
+            state.from_r = shown_r;
+            state.from_g = shown_g;
+            state.from_b = shown_b;
         }
         state.pad = target;
         state.mode = mode;
@@ -159,6 +166,7 @@ void SetLed(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on, u8 off, u8 count, u8 speed
         state.off = off;
         state.count = count;
         state.speed = speed;
+        state.restart = static_cast<u8>((state.restart + 1) & 0x0F);
         ++g_led_counter;
     };
     if (pad == 0) {
@@ -170,9 +178,42 @@ void SetLed(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on, u8 off, u8 count, u8 speed
     }
 }
 
+// Fase 82: contagens do portal -> `count` do estado (0 = para sempre). Piscada: 0x00 = so troca para a cor nova (cor
+// fixa, ver Flash); 0xFF ou >= 0xC7 = para sempre; 1..0xC6 = fases. Fade: 0x00 ou >= 0xC8 = para sempre.
+u8 FlashCount(u8 count) {
+    return count >= 0xC7 ? 0 : count;
+}
+
+u8 FadeCount(u8 count) {
+    return count >= 0xC8 ? 0 : count;
+}
+
+void Flash(u8 pad, u8 on, u8 off, u8 count, u8 r, u8 g, u8 b) {
+    if (count == 0) {
+        SetLed(pad, 1, r, g, b, 0, 0, 0, 0); // o portal "muda para a nova" sem piscar
+    } else {
+        SetLed(pad, 2, r, g, b, on, off, FlashCount(count), 0);
+    }
+}
+
+bool LedTrace() { // LD_TOYPAD_LED_LOG=1: cada comando de LED no log
+    static const bool trace = [] {
+        const char* value = std::getenv("LD_TOYPAD_LED_LOG");
+        return value && *value && *value != '0';
+    }();
+    return trace;
+}
+
 // Comandos de LED do jogo (0xC0..0xC8); `p` = payload (bytes depois de 0x55, tamanho, comando, sequencia).
 void HandleLedCommand(u8 cmd, const u8* p, u32 size) {
     auto has = [&](u32 bytes) { return size >= bytes; };
+    if (LedTrace()) {
+        char hex[3 * 24 + 1] = {};
+        for (u32 i = 0; i < size && i < 24; ++i) {
+            std::snprintf(hex + i * 3, 4, "%02x ", p[i]);
+        }
+        log::Tagged("PORTAL-LED", "0x%02X %s", cmd, hex);
+    }
     switch (cmd) {
     case 0xC0: // cor: zona, r, g, b
         if (has(4)) {
@@ -181,40 +222,38 @@ void HandleLedCommand(u8 cmd, const u8* p, u32 size) {
         break;
     case 0xC2: // fade: zona, tempo do passo, passos, r, g, b
         if (has(6)) {
-            SetLed(p[0], 3, p[3], p[4], p[5], 0, 0, p[2], p[1]);
+            SetLed(p[0], 3, p[3], p[4], p[5], 0, 0, FadeCount(p[2]), p[1]);
         }
         break;
-    case 0xC3: // piscar: zona, aceso, apagado, vezes (0xFF = sempre), r, g, b
+    case 0xC3: // piscar: zona, aceso, apagado, fases (0x00 = so troca a cor, 0xFF = sempre), r, g, b
         if (has(7)) {
-            SetLed(p[0], 2, p[4], p[5], p[6], p[1], p[2], p[3] == 0xFF ? 0 : p[3], 0);
+            Flash(p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
         }
         break;
     case 0xC4: // fade para uma cor aleatoria: zona, tempo do passo, passos (cada zona sorteia a sua)
         if (has(3)) {
             for (u8 target = 1; target <= kPadCount; ++target) {
                 if (p[0] == 0 || p[0] == target) {
-                    SetLed(target, 3, LedRandomByte(), LedRandomByte(), LedRandomByte(), 0, 0, p[2], p[1]);
+                    SetLed(target, 3, LedRandomByte(), LedRandomByte(), LedRandomByte(), 0, 0, FadeCount(p[2]), p[1]);
                 }
             }
         }
         break;
-    case 0xC6: // fade em todas: por zona [ligada][tempo][passos][r][g][b]
+    // Fase 82: nos comandos "em todas", ligada = 0 deixa a zona como esta ("Ignored pads will continue whatever they were
+    // doing previously"); apagar e ligada = 1 com a cor 0, 0, 0. Antes o 0 apagava a zona no app.
+    case 0xC6: // fade em todas: por zona [ligada][tempo][passos][r][g][b]; passos 0x00 aqui tambem = nao mexe na zona
         for (u8 zone = 0; zone < kPadCount && has((zone + 1) * 6u); ++zone) {
             const u8* z = p + zone * 6;
-            if (z[0]) {
-                SetLed(zone + 1, 3, z[3], z[4], z[5], 0, 0, z[2], z[1]);
-            } else {
-                SetLed(zone + 1, 0, 0, 0, 0, 0, 0, 0, 0);
+            if (z[0] && z[2]) {
+                SetLed(zone + 1, 3, z[3], z[4], z[5], 0, 0, FadeCount(z[2]), z[1]);
             }
         }
         break;
-    case 0xC7: // piscar em todas: por zona [ligada][aceso][apagado][vezes][r][g][b]
+    case 0xC7: // piscar em todas: por zona [ligada][aceso][apagado][fases][r][g][b]
         for (u8 zone = 0; zone < kPadCount && has((zone + 1) * 7u); ++zone) {
             const u8* z = p + zone * 7;
             if (z[0]) {
-                SetLed(zone + 1, 2, z[4], z[5], z[6], z[1], z[2], z[3] == 0xFF ? 0 : z[3], 0);
-            } else {
-                SetLed(zone + 1, 0, 0, 0, 0, 0, 0, 0, 0);
+                Flash(zone + 1, z[1], z[2], z[3], z[4], z[5], z[6]);
             }
         }
         break;
@@ -223,8 +262,6 @@ void HandleLedCommand(u8 cmd, const u8* p, u32 size) {
             const u8* z = p + zone * 4;
             if (z[0]) {
                 SetLed(zone + 1, 1, z[1], z[2], z[3], 0, 0, 0, 0);
-            } else {
-                SetLed(zone + 1, 0, 0, 0, 0, 0, 0, 0, 0);
             }
         }
         break;
@@ -549,7 +586,9 @@ void LedSnapshot(u8 out[kLedSnapshotBytes]) {
     for (int zone = 0; zone < kPadCount; ++zone) { // 12 bytes por zona
         const LedState& led = g_led[zone];
         u8* z = out + 4 + zone * 12;
-        z[0] = static_cast<u8>(zone + 1); // a zona e conhecida mesmo antes do primeiro comando
+        // a zona e conhecida mesmo antes do primeiro comando; Fase 82: no nibble de cima o contador de recomeco (o app
+        // recomeca a animacao quando ele muda; apps antigos so leem o de baixo)
+        z[0] = static_cast<u8>((zone + 1) | (led.restart << 4));
         z[1] = led.mode;
         z[2] = led.r;
         z[3] = led.g;

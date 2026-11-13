@@ -45,6 +45,7 @@ constexpr uint32_t kRosterMagic = 0x5247444C; // 'LDGR'
 constexpr uint32_t kRosterVersion = 1;
 constexpr uint32_t kRosterCapOwnership = 1u << 0;     // o jogo le LegoToypadInputOwnership v1
 constexpr uint32_t kRosterCapShareKeyboard = 1u << 1; // o jogo entende kOwnershipFlagShareKeyboard
+constexpr uint32_t kRosterCapPadFreeze = 1u << 2;     // Fase 82: frozenZones vale (o jogo sabe quais zonas estao congeladas)
 
 constexpr uint8_t kSlotKindNone = 0;
 constexpr uint8_t kSlotKindKeyboard = 1;   // so teclado (o jogador do teclado sem controle)
@@ -82,7 +83,10 @@ struct GameInputRoster { // 1600 bytes
     uint32_t capabilities;    // kRosterCap*
     uint64_t heartbeatTickMs; // GetTickCount64() da ultima escrita (a cada 250 ms)
     uint32_t appliedCapture;  // mascara que o jogo esta aplicando agora (depois das checagens de vida)
-    uint32_t reserved[3];
+    uint32_t frozenZones;     // Fase 82 (com kRosterCapPadFreeze; era reserved[0]): zonas do Toy Pad com personagens
+                              // presos por um ataque de chefe (AvoidAttack do jogo), bit 0 = zona 1 (centro), bit 1 =
+                              // zona 2 (esquerda), bit 2 = zona 3 (direita); 0 = nada. Publicado assim que muda.
+    uint32_t reserved[2];
     GameInputSlot slot[4];    // pelo numero de jogador DO JOGO: slot[0] = jogador 1
 };
 static_assert(sizeof(GameInputRoster) == 1600);

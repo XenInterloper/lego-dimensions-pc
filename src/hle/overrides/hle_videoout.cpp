@@ -138,6 +138,8 @@ bool g_controls_dirty = false;           // teclas mudaram: refazer as dicas de 
 std::mutex g_controls_note_mutex;
 std::string g_controls_note;             // aviso (tecla reservada, tecla tirada de outra acao)
 bool g_cursor_clipped = false;           // camera pelo mouse: ponteiro preso e escondido na janela
+bool g_capture_armed = false;            // so prende depois de um clique DENTRO do jogo (nao na barra de titulo / borda)
+bool g_in_size_move = false;             // arrastando / redimensionando a janela: nunca prende
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
@@ -602,10 +604,18 @@ void HandleControlsKey(WPARAM wp, LPARAM lp) {
     g_controls_sel = sel;
 }
 
-// Camera pelo mouse: com a janela na frente e nenhum menu do port aberto, o ponteiro fica preso e escondido na area do
-// jogo (senao ele sai da janela e um clique cai em outro programa). Alt+Tab, outro menu ou desligar a opcao soltam.
+// O jogo usa o mouse: camera pelo mouse ou alguma acao num botao do mouse (ex.: atacar no clique esquerdo).
+bool MouseInUse() {
+    return padkeys::MouseLook() || padkeys::MouseButtonBound();
+}
+
+// Camera pelo mouse ou botao do mouse em uso: com a janela na frente e nenhum menu do port aberto, o ponteiro fica preso
+// e escondido na area do jogo (senao ele sai da janela e um clique cai em outro programa). Alt+Tab, outro menu, o
+// LegoToypad na frente ou nenhuma acao no mouse soltam. So prende depois de um clique na area do jogo: clicar na barra de
+// titulo ou na borda (arrastar / redimensionar) ou voltar com Alt+Tab nao prende ate o proximo clique dentro.
 void UpdateMouseCapture(HWND hwnd, bool force = false) {
-    const bool want = padkeys::MouseLook() && GetForegroundWindow() == hwnd && !IsIconic(hwnd) && !g_video_menu_open.load() &&
+    const bool want = g_capture_armed && !g_in_size_move && MouseInUse() && GetForegroundWindow() == hwnd && !IsIconic(hwnd) &&
+                      !g_video_menu_open.load() &&
                       !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !g_controls_menu_open.load();
     if (want == g_cursor_clipped && !force) {
         return;
@@ -929,6 +939,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return DefWindowProcA(hwnd, msg, wparam, lparam);
     case WM_ACTIVATE: // Fase 81: perdeu a frente = solta o ponteiro; voltou = prende de novo (camera pelo mouse)
         if (LOWORD(wparam) == WA_INACTIVE) {
+            g_capture_armed = false; // na volta, so prende de novo com um clique dentro do jogo
             if (g_cursor_clipped) {
                 ClipCursor(nullptr);
                 g_cursor_clipped = false;
@@ -960,6 +971,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                               : GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2);
             return msg == WM_XBUTTONDOWN ? TRUE : 0;
         }
+        if (!g_capture_armed) { // clique na area do jogo: agora o ponteiro pode ser preso
+            g_capture_armed = true;
+            UpdateMouseCapture(hwnd);
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_MOUSEACTIVATE: // clique que traz a janela para a frente: so na area do jogo arma a captura
+        g_capture_armed = LOWORD(lparam) == HTCLIENT;
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_NCLBUTTONDOWN:
+    case WM_NCRBUTTONDOWN:
+    case WM_NCMBUTTONDOWN: // barra de titulo / borda: nada de prender ate um clique dentro do jogo
+        g_capture_armed = false;
+        UpdateMouseCapture(hwnd);
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_ENTERSIZEMOVE:
+        g_in_size_move = true;
+        UpdateMouseCapture(hwnd);
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_EXITSIZEMOVE:
+        g_in_size_move = false;
         return DefWindowProcA(hwnd, msg, wparam, lparam);
     case WM_SYSKEYDOWN: // Fase 81: Alt (e F10) no menu F3 esperando uma tecla
         if (g_controls_menu_open.load() && g_controls_capture.load() >= 0 && wparam != VK_F4) {
@@ -3023,6 +3054,20 @@ void* WindowHandle() {
 bool WindowHasFocus() {
     const HWND hwnd = g_hwnd.load();
     return hwnd && GetForegroundWindow() == hwnd;
+}
+
+void OnToypadInFront() {
+    if (!g_hwnd.load() || !MouseInUse()) {
+        return; // o ponteiro nao estava preso: fica onde o jogador deixou
+    }
+    const HWND front = GetForegroundWindow();
+    RECT rc;
+    if (!front || !GetWindowRect(front, &rc)) {
+        return;
+    }
+    ClipCursor(nullptr); // o WM_ACTIVATE da janela do jogo tambem solta, mas pode chegar depois
+    SetCursorPos(rc.left + (rc.right - rc.left) / 2, rc.top + (rc.bottom - rc.top) / 2);
+    log::Tagged("PAD", "LegoToypad in front: mouse pointer centred on it");
 }
 
 } // namespace hle::videoout

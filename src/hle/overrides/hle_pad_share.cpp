@@ -21,6 +21,8 @@
 
 #include "hle/hle_log.h"
 #include "hle/overrides/hle_pad_sdl.h"
+#include "hle/overrides/hle_avoid_attack.h"
+#include "hle/overrides/hle_videoout.h"
 
 namespace hle {
 bool PadDevicePresent(int slot); // hle_pad.cpp
@@ -184,6 +186,9 @@ bool PollOwnership(ULONGLONG now) {
         log::Tagged("TOYPAD-INPUT", "captured players: P1 %s, P2 %s, P3 %s, P4 %s (flags 0x%x)", (captured & 1) ? "yes" : "no",
                     (captured & 2) ? "yes" : "no", (captured & 4) ? "yes" : "no", (captured & 8) ? "yes" : "no", block.flags);
     }
+    if (in_front && !g_picker_front.exchange(true)) {
+        videoout::OnToypadInFront(); // o painel abriu: o ponteiro vai para o meio dele
+    }
     g_picker_front = in_front;
     g_keyboard_shared = (block.flags & kOwnershipFlagShareKeyboard) != 0;
     return true;
@@ -192,6 +197,34 @@ bool PollOwnership(ULONGLONG now) {
 // ---- Local\LegoDimensionsInputRoster -----------------------------------------------------------------
 HANDLE g_roster_mapping = nullptr;
 void* g_roster_view = nullptr;
+
+// Fase 82: zonas com personagens presos por um ataque de chefe (hle_avoid_attack: o estado do proprio jogo, lido
+// por ganchos no eboot). LD_PAD_FREEZE=<mascara> forca um valor (teste sem o chefe); LD_PAD_FREEZE_DETECT=0 desliga
+// (o bit kRosterCapPadFreeze some e o LegoToypad ignora o atalho). Sem os ganchos (outro eboot) o bit tambem some.
+int ForcedFreeze() { // -1 = sem forcar
+    static const int forced = [] {
+        const char* value = std::getenv("LD_PAD_FREEZE");
+        return value && *value ? static_cast<int>(std::strtoul(value, nullptr, 0) & 7) : -1;
+    }();
+    return forced;
+}
+
+bool FreezeDetection() {
+    static const bool allowed = [] {
+        const char* value = std::getenv("LD_PAD_FREEZE_DETECT");
+        return !(value && *value == '0');
+    }();
+    return ForcedFreeze() >= 0 || (allowed && avoidattack::Installed());
+}
+
+uint32_t CurrentFrozenZones() {
+    if (ForcedFreeze() >= 0) {
+        return static_cast<uint32_t>(ForcedFreeze());
+    }
+    return FreezeDetection() ? avoidattack::FrozenZones() : 0;
+}
+
+std::atomic<uint32_t> g_frozen_published{0};
 
 void PublishRoster(ULONGLONG now) {
     if (!g_roster_view) {
@@ -211,7 +244,8 @@ void PublishRoster(ULONGLONG now) {
     roster.magic = kRosterMagic;
     roster.version = kRosterVersion;
     roster.gamePid = GetCurrentProcessId();
-    roster.capabilities = kRosterCapOwnership | kRosterCapShareKeyboard;
+    roster.capabilities = kRosterCapOwnership | kRosterCapShareKeyboard | (FreezeDetection() ? kRosterCapPadFreeze : 0);
+    roster.frozenZones = g_frozen_published.load();
     roster.heartbeatTickMs = now;
     roster.appliedCapture = g_captured.load();
     const int sdl_count = padsdl::Count();
@@ -267,7 +301,12 @@ void Thread() {
     for (;;) {
         const ULONGLONG now = GetTickCount64();
         const bool live = PollOwnership(now);
-        if (now >= next_roster) {
+        const uint32_t frozen = CurrentFrozenZones();
+        const uint32_t before = g_frozen_published.exchange(frozen);
+        if (frozen != before) { // Fase 82: na hora, fora do ciclo
+            log::Tagged("TOYPAD-INPUT", "frozen toy pad zones: 0x%x (bit 0 = centre, 1 = left, 2 = right)", frozen);
+        }
+        if (now >= next_roster || frozen != before) {
             next_roster = now + kRosterMs;
             PublishRoster(now);
         }

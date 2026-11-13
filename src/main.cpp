@@ -23,6 +23,7 @@
 #include "hle/overrides/hle_filesystem.h"
 #include "hle/overrides/hle_anomaly.h"
 #include "hle/overrides/hle_mods.h"
+#include "hle/overrides/hle_avoid_attack.h"
 #include "hle/overrides/hle_pad_share.h"
 #include "hle/overrides/hle_toypad.h"
 #include "hle/overrides/hle_videoout.h"
@@ -1706,6 +1707,7 @@ int main(int argc, char** argv) {
     }
     if (!selftest) {
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod
+        hle::avoidattack::Install(elf.base()); // Fase 82: zonas presas por ataques de chefe, para o roster do LegoToypad
     }
     if (!elf.Protect()) {
         std::printf("ERROR: %s\n", elf.error().c_str());

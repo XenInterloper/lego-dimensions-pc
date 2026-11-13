@@ -575,9 +575,22 @@ u32 PadHeldSinceFocus(u32 buttons) {
 }
 
 // Fase 80: jogador capturado pelo LegoToypad (hle_pad_share) = todos os aparelhos dele parados (sticks no centro,
-// gatilhos e botoes soltos; o teclado, no jogador do teclado). Ao ser liberado continua parado ate tudo voltar ao
-// repouso pelo menos uma vez: o B / botao que fechou o app nao vira um pulo, ataque ou pausa no jogo.
-std::atomic<bool> g_capture_hold[padsdl::kSlots];
+// gatilhos e botoes soltos; o teclado, no jogador do teclado).
+// Fase 82: ao ser liberado o jogador ja volta no primeiro quadro; so o que estava apertado naquela hora (o B / atalho
+// que fechou o app) fica de fora ate ser solto, botao por botao, como o PadHeldSinceFocus. Antes ele ficava parado ate
+// TUDO voltar ao repouso (inclinado no analogico = parado). LD_PAD_CAPTURE_ATREST=1 volta a regra antiga.
+std::atomic<bool> g_capture_hold[padsdl::kSlots];       // capturado, ou ainda segurando o que fechou o app
+std::atomic<bool> g_capture_releasing[padsdl::kSlots];  // ja liberado, com as mascaras abaixo tiradas
+std::atomic<u32> g_capture_held_buttons[padsdl::kSlots]; // botoes apertados quando a captura acabou
+std::atomic<u8> g_capture_held_triggers[padsdl::kSlots]; // bit 0 = L2, bit 1 = R2
+
+bool CaptureAtRestRule() {
+    static const bool old_rule = [] {
+        const char* value = std::getenv("LD_PAD_CAPTURE_ATREST");
+        return value && *value && *value != '0';
+    }();
+    return old_rule;
+}
 
 bool AtRest(const Input& in) {
     const auto centered = [](u8 v) { return v >= 0x80 - 0x30 && v <= 0x80 + 0x30; };
@@ -592,28 +605,62 @@ void StopRumble(int slot) {
     padsdl::Rumble(0, 0, slot);
 }
 
-bool PlayerHeld(int slot) {
-    return slot >= 0 && slot < padsdl::kSlots && g_capture_hold[slot].load(std::memory_order_relaxed);
+bool PlayerHeld(int slot) { // dentro do app (no "segurando o que fechou" o jogador ja joga, e o controle vibra)
+    return slot >= 0 && slot < padsdl::kSlots && g_capture_hold[slot].load(std::memory_order_relaxed) &&
+           !g_capture_releasing[slot].load(std::memory_order_relaxed);
 }
 
-// raw = o que os aparelhos do jogador mandam agora; true = a entrada dele fica neutra neste quadro.
-bool CaptureGate(int slot, const Input& raw) {
+// in = o que os aparelhos do jogador mandam agora. true = a entrada dele fica neutra neste quadro (dentro do app);
+// false = o jogador joga, com o que fechou o app (se ainda apertado) tirado de `in`.
+bool CaptureGate(int slot, Input& in) {
     std::atomic<bool>& hold = g_capture_hold[slot];
     if ((padshare::CapturedPlayers() >> slot) & 1) {
         if (!hold.exchange(true)) {
             StopRumble(slot);
             log::Tagged("PAD", "t=%.1fs player %d: in LegoToypad, input neutral", Seconds(), slot + 1);
         }
+        g_capture_releasing[slot] = false;
         return true;
     }
     if (!hold.load()) {
         return false;
     }
-    if (!AtRest(raw)) {
-        return true; // ainda segurando o que fechou o app
+    if (CaptureAtRestRule()) {
+        if (!AtRest(in)) {
+            return true; // ainda segurando o que fechou o app
+        }
+        hold = false;
+        log::Tagged("PAD", "t=%.1fs player %d: back from LegoToypad, input enabled", Seconds(), slot + 1);
+        return false;
     }
-    hold = false;
-    log::Tagged("PAD", "t=%.1fs player %d: back from LegoToypad, input enabled", Seconds(), slot + 1);
+    if (!g_capture_releasing[slot].exchange(true)) { // primeiro quadro depois da captura
+        g_capture_held_buttons[slot] = in.buttons;
+        g_capture_held_triggers[slot] = static_cast<u8>((in.l2 > 40 ? 1 : 0) | (in.r2 > 40 ? 2 : 0));
+        log::Tagged("PAD", "t=%.1fs player %d: back from LegoToypad, input enabled (held back until released: buttons 0x%05x%s%s)",
+                    Seconds(), slot + 1, in.buttons, in.l2 > 40 ? " L2" : "", in.r2 > 40 ? " R2" : "");
+    }
+    const u32 buttons = g_capture_held_buttons[slot].load() & in.buttons; // botao solto sai da mascara
+    u8 triggers = g_capture_held_triggers[slot].load();
+    if (in.l2 < 30) {
+        triggers &= static_cast<u8>(~1u);
+    }
+    if (in.r2 < 30) {
+        triggers &= static_cast<u8>(~2u);
+    }
+    g_capture_held_buttons[slot] = buttons;
+    g_capture_held_triggers[slot] = triggers;
+    if (!buttons && !triggers) {
+        hold = false;
+        g_capture_releasing[slot] = false;
+        return false;
+    }
+    in.buttons &= ~buttons;
+    if (triggers & 1) {
+        in.l2 = 0;
+    }
+    if (triggers & 2) {
+        in.r2 = 0;
+    }
     return false;
 }
 
@@ -1344,6 +1391,23 @@ void SetBinding(int i, int vk) {
         g_key_vk[other] = 0; // cada tecla faz uma coisa so
     }
     g_key_vk[i] = vk;
+}
+
+bool MouseButtonBound() {
+    EnsureKeyboardConfig();
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        switch (g_key_vk[i].load()) {
+        case VK_LBUTTON:
+        case VK_RBUTTON:
+        case VK_MBUTTON:
+        case VK_XBUTTON1:
+        case VK_XBUTTON2:
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
 }
 
 void ResetBindings() {

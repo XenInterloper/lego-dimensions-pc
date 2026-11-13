@@ -96,6 +96,8 @@ bool IsControlsMenuOpen();
 bool WindowHasFocus();
 // HWND da janela do jogo (nullptr se nao ha janela): dona dos dialogos do port.
 void* WindowHandle();
+// O LegoToypad acabou de vir para a frente: se o jogo prendia o ponteiro, ele vai para o meio do painel.
+void OnToypadInFront();
 
 } // namespace hle::videoout
 
